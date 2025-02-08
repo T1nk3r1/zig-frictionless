@@ -2579,10 +2579,6 @@ fn labeledBlockExpr(
         _ = try block_scope.addBreak(break_tag, block_inst, result);
     }
 
-    if (!block_scope.label.?.used) {
-        try astgen.appendErrorTok(label_token, "unused block label", .{});
-    }
-
     if (force_comptime) {
         try block_scope.setBlockComptimeBody(block_inst, .comptime_keyword);
     } else {
@@ -3143,47 +3139,10 @@ fn genDefers(
 }
 
 fn checkUsed(gz: *GenZir, outer_scope: *Scope, inner_scope: *Scope) InnerError!void {
-    const astgen = gz.astgen;
-
-    var scope = inner_scope;
-    while (scope != outer_scope) {
-        switch (scope.tag) {
-            .gen_zir => scope = scope.cast(GenZir).?.parent,
-            .local_val => {
-                const s = scope.cast(Scope.LocalVal).?;
-                if (s.used == 0 and s.discarded == 0) {
-                    try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
-                } else if (s.used != 0 and s.discarded != 0) {
-                    try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
-                        try gz.astgen.errNoteTok(s.used, "used here", .{}),
-                    });
-                }
-                scope = s.parent;
-            },
-            .local_ptr => {
-                const s = scope.cast(Scope.LocalPtr).?;
-                if (s.used == 0 and s.discarded == 0) {
-                    try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
-                } else {
-                    if (s.used != 0 and s.discarded != 0) {
-                        try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
-                            try astgen.errNoteTok(s.used, "used here", .{}),
-                        });
-                    }
-                    if (s.id_cat == .@"local variable" and !s.used_as_lvalue) {
-                        try astgen.appendErrorTokNotes(s.token_src, "local variable is never mutated", .{}, &.{
-                            try astgen.errNoteTok(s.token_src, "consider using 'const'", .{}),
-                        });
-                    }
-                }
-
-                scope = s.parent;
-            },
-            .defer_normal, .defer_error => scope = scope.cast(Scope.Defer).?.parent,
-            .namespace => unreachable,
-            .top => unreachable,
-        }
-    }
+    _ = gz;
+    _ = outer_scope;
+    _ = inner_scope;
+    return;
 }
 
 fn deferStmt(
@@ -6977,12 +6936,6 @@ fn whileExpr(
         _ = try else_scope.addBreak(break_tag, loop_block, result);
     }
 
-    if (loop_scope.label) |some| {
-        if (!some.used) {
-            try astgen.appendErrorTok(some.token, "unused while loop label", .{});
-        }
-    }
-
     try setCondBrPayload(condbr, cond.bool_bit, &then_scope, &else_scope);
 
     const result = if (need_result_rvalue)
@@ -7269,12 +7222,6 @@ fn forExpr(
     } else {
         const result = try rvalue(&else_scope, ri, .void_value, node);
         _ = try else_scope.addBreak(break_tag, loop_block, result);
-    }
-
-    if (loop_scope.label) |some| {
-        if (!some.used) {
-            try astgen.appendErrorTok(some.token, "unused for loop label", .{});
-        }
     }
 
     try setCondBrPayload(condbr, cond, &then_scope, &else_scope);
@@ -8214,10 +8161,6 @@ fn switchExpr(
             appendBodyWithFixupsExtraRefsArrayList(astgen, payloads, case_slice, extra_insts);
         }
     }
-
-    if (switch_full.label_token) |label_token| if (!block_scope.label.?.used) {
-        try astgen.appendErrorTok(label_token, "unused switch label", .{});
-    };
 
     // Now that the item expressions are generated we can add this.
     try parent_gz.instructions.append(gpa, switch_block);
