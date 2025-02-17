@@ -2484,7 +2484,6 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
             .reduce           => try cg.airReduce(inst),
             .reduce_optimized => try cg.airReduce(inst),
             .aggregate_init   => try cg.airAggregateInit(inst),
-            .prefetch         => try cg.airPrefetch(inst),
             // zig fmt: on
 
             .arg => if (cg.debug_output != .none) {
@@ -76418,6 +76417,33 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
                 }, cg);
                 try res.finish(inst, &.{extra.init}, &ops, cg);
             },
+            .prefetch => {
+                const prefetch = air_datas[@intFromEnum(inst)].prefetch;
+                var ops = try cg.tempsFromOperands(inst, .{prefetch.ptr});
+                switch (prefetch.cache) {
+                    .instruction => {}, // prefetchi requires rip-relative addressing, which is currently non-trivial to emit from an arbitrary ptr value
+                    .data => if (prefetch.rw == .write and prefetch.locality <= 2 and cg.hasFeature(.prefetchwt1)) {
+                        try ops[0].toSlicePtr(cg);
+                        while (try ops[0].toLea(cg)) {}
+                        try cg.asmMemory(.{ ._wt1, .prefetch }, try ops[0].tracking(cg).short.deref().mem(cg, .{ .size = .byte }));
+                    } else if (prefetch.rw == .write and cg.hasFeature(.prfchw)) {
+                        try ops[0].toSlicePtr(cg);
+                        while (try ops[0].toLea(cg)) {}
+                        try cg.asmMemory(.{ ._w, .prefetch }, try ops[0].tracking(cg).short.deref().mem(cg, .{ .size = .byte }));
+                    } else if (cg.hasFeature(.sse) or cg.hasFeature(.prfchw) or cg.hasFeature(.prefetchi) or cg.hasFeature(.prefetchwt1)) {
+                        try ops[0].toSlicePtr(cg);
+                        while (try ops[0].toLea(cg)) {}
+                        switch (prefetch.locality) {
+                            0 => try cg.asmMemory(.{ ._nta, .prefetch }, try ops[0].tracking(cg).short.deref().mem(cg, .{ .size = .byte })),
+                            1 => try cg.asmMemory(.{ ._t2, .prefetch }, try ops[0].tracking(cg).short.deref().mem(cg, .{ .size = .byte })),
+                            2 => try cg.asmMemory(.{ ._t1, .prefetch }, try ops[0].tracking(cg).short.deref().mem(cg, .{ .size = .byte })),
+                            3 => try cg.asmMemory(.{ ._t0, .prefetch }, try ops[0].tracking(cg).short.deref().mem(cg, .{ .size = .byte })),
+                        }
+                    },
+                }
+                const res = try cg.tempInit(.void, .none);
+                try res.finish(inst, &.{prefetch.ptr}, &ops, cg);
+            },
             .mul_add => |air_tag| if (use_old) try cg.airMulAdd(inst) else {
                 const pl_op = air_datas[@intFromEnum(inst)].pl_op;
                 const bin_op = cg.air.extraData(Air.Bin, pl_op.payload).data;
@@ -94741,11 +94767,6 @@ fn airUnionInit(self: *CodeGen, inst: Air.Inst.Index) !void {
         break :result dst_mcv;
     };
     return self.finishAir(inst, result, .{ extra.init, .none, .none });
-}
-
-fn airPrefetch(self: *CodeGen, inst: Air.Inst.Index) !void {
-    const prefetch = self.air.instructions.items(.data)[@intFromEnum(inst)].prefetch;
-    return self.finishAir(inst, .unreach, .{ prefetch.ptr, .none, .none });
 }
 
 fn airMulAdd(self: *CodeGen, inst: Air.Inst.Index) !void {
