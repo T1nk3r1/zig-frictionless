@@ -37,6 +37,7 @@ pub const available_libcs = [_]ArchOsAbi{
     .{ .arch = .loongarch64, .os = .linux, .abi = .gnu, .os_ver = .{ .major = 5, .minor = 19, .patch = 0 }, .glibc_min = .{ .major = 2, .minor = 36, .patch = 0 }, .glibc_triple = "loongarch64-linux-gnu-lp64d" },
     .{ .arch = .loongarch64, .os = .linux, .abi = .gnusf, .os_ver = .{ .major = 5, .minor = 19, .patch = 0 }, .glibc_min = .{ .major = 2, .minor = 36, .patch = 0 }, .glibc_triple = "loongarch64-linux-gnu-lp64s" },
     .{ .arch = .loongarch64, .os = .linux, .abi = .musl, .os_ver = .{ .major = 5, .minor = 19, .patch = 0 } },
+    .{ .arch = .loongarch64, .os = .linux, .abi = .muslsf, .os_ver = .{ .major = 5, .minor = 19, .patch = 0 } },
     .{ .arch = .m68k, .os = .linux, .abi = .gnu, .os_ver = .{ .major = 1, .minor = 3, .patch = 94 } },
     .{ .arch = .m68k, .os = .linux, .abi = .musl, .os_ver = .{ .major = 1, .minor = 3, .patch = 94 } },
     .{ .arch = .mips, .os = .linux, .abi = .gnueabi, .os_ver = .{ .major = 1, .minor = 1, .patch = 82 }, .glibc_triple = "mips-linux-gnu-soft" },
@@ -72,7 +73,7 @@ pub const available_libcs = [_]ArchOsAbi{
     .{ .arch = .sparc, .os = .linux, .abi = .gnu, .os_ver = .{ .major = 2, .minor = 1, .patch = 19 }, .glibc_triple = "sparcv9-linux-gnu" },
     .{ .arch = .sparc64, .os = .linux, .abi = .gnu, .os_ver = .{ .major = 2, .minor = 1, .patch = 19 } },
     .{ .arch = .wasm32, .os = .wasi, .abi = .musl },
-    .{ .arch = .x86, .os = .linux, .abi = .gnu },
+    .{ .arch = .x86, .os = .linux, .abi = .gnu, .glibc_triple = "i686-linux-gnu" },
     .{ .arch = .x86, .os = .linux, .abi = .musl },
     .{ .arch = .x86, .os = .windows, .abi = .gnu },
     .{ .arch = .x86_64, .os = .linux, .abi = .gnu, .os_ver = .{ .major = 2, .minor = 6, .patch = 4 } },
@@ -126,6 +127,23 @@ pub fn glibcRuntimeTriple(
         .hurd => std.Target.hurdTupleSimple(allocator, arch, abi),
         .linux => std.Target.linuxTripleSimple(allocator, arch, os, abi),
         else => unreachable,
+    };
+}
+
+pub fn osArchName(target: std.Target) [:0]const u8 {
+    return switch (target.os.tag) {
+        .linux => switch (target.cpu.arch) {
+            .arm, .armeb, .thumb, .thumbeb => "arm",
+            .aarch64, .aarch64_be => "aarch64",
+            .loongarch32, .loongarch64 => "loongarch",
+            .mips, .mipsel, .mips64, .mips64el => "mips",
+            .powerpc, .powerpcle, .powerpc64, .powerpc64le => "powerpc",
+            .riscv32, .riscv64 => "riscv",
+            .sparc, .sparc64 => "sparc",
+            .x86, .x86_64 => "x86",
+            else => @tagName(target.cpu.arch),
+        },
+        else => @tagName(target.cpu.arch),
     };
 }
 
@@ -225,6 +243,8 @@ pub fn isLibCLibName(target: std.Target, name: []const u8) bool {
             return true;
         if (eqlIgnoreCase(ignore_case, name, "wbemuuid"))
             return true;
+        if (eqlIgnoreCase(ignore_case, name, "wiaguid"))
+            return true;
         if (eqlIgnoreCase(ignore_case, name, "winpthread"))
             return true;
         if (eqlIgnoreCase(ignore_case, name, "wmcodecdspuuid"))
@@ -296,6 +316,17 @@ pub fn isLibCLibName(target: std.Target, name: []const u8) bool {
         if (eqlIgnoreCase(ignore_case, name, "root"))
             return true;
         if (eqlIgnoreCase(ignore_case, name, "network"))
+            return true;
+    }
+
+    if (target.os.tag == .serenity) {
+        if (eqlIgnoreCase(ignore_case, name, "dl"))
+            return true;
+        if (eqlIgnoreCase(ignore_case, name, "m"))
+            return true;
+        if (eqlIgnoreCase(ignore_case, name, "pthread"))
+            return true;
+        if (eqlIgnoreCase(ignore_case, name, "ssp"))
             return true;
     }
 

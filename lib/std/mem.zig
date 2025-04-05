@@ -228,6 +228,18 @@ test "Allocator.resize" {
     }
 }
 
+test "Allocator alloc and remap with zero-bit type" {
+    var values = try testing.allocator.alloc(void, 10);
+    defer testing.allocator.free(values);
+
+    try testing.expectEqual(10, values.len);
+    const remaped = testing.allocator.remap(values, 200);
+    try testing.expect(remaped != null);
+
+    values = remaped.?;
+    try testing.expectEqual(200, values.len);
+}
+
 /// Copy all of source into dest at position 0.
 /// dest.len must be >= source.len.
 /// If the slices overlap, dest.ptr must be <= src.ptr.
@@ -1098,12 +1110,12 @@ pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]co
             // as we don't read into a new page. This should be the case for most architectures
             // which use paged memory, however should be confirmed before adding a new arch below.
             .aarch64, .x86, .x86_64 => if (std.simd.suggestVectorLength(T)) |block_len| {
-                const page_size = std.heap.pageSize();
+                const page_size = std.heap.page_size_min;
                 const block_size = @sizeOf(T) * block_len;
                 const Block = @Vector(block_len, T);
                 const mask: Block = @splat(sentinel);
 
-                comptime assert(std.heap.page_size_max % @sizeOf(Block) == 0);
+                comptime assert(std.heap.page_size_min % @sizeOf(Block) == 0);
                 assert(page_size % @sizeOf(Block) == 0);
 
                 // First block may be unaligned
@@ -1119,6 +1131,7 @@ pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]co
 
                     i += @divExact(std.mem.alignForward(usize, start_addr, block_size) - start_addr, @sizeOf(T));
                 } else {
+                    @branchHint(.unlikely);
                     // Would read over a page boundary. Per-byte at a time until aligned or found.
                     // 0.39% chance this branch is taken for 4K pages at 16b block length.
                     //
@@ -1152,7 +1165,7 @@ pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]co
 test "indexOfSentinel vector paths" {
     const Types = [_]type{ u8, u16, u32, u64 };
     const allocator = std.testing.allocator;
-    const page_size = std.heap.pageSize();
+    const page_size = std.heap.page_size_min;
 
     inline for (Types) |T| {
         const block_len = std.simd.suggestVectorLength(T) orelse continue;
@@ -1396,6 +1409,7 @@ pub fn indexOf(comptime T: type, haystack: []const T, needle: []const T) ?usize 
 /// Consider using `lastIndexOf` instead of this, which will automatically use a
 /// more sophisticated algorithm on larger inputs.
 pub fn lastIndexOfLinear(comptime T: type, haystack: []const T, needle: []const T) ?usize {
+    if (needle.len > haystack.len) return null;
     var i: usize = haystack.len - needle.len;
     while (true) : (i -= 1) {
         if (mem.eql(T, haystack[i..][0..needle.len], needle)) return i;
@@ -1610,6 +1624,8 @@ test count {
 /// Returns true if the haystack contains expected_count or more needles
 /// needle.len must be > 0
 /// does not count overlapping needles
+//
+/// See also: `containsAtLeastScalar`
 pub fn containsAtLeast(comptime T: type, haystack: []const T, expected_count: usize, needle: []const T) bool {
     assert(needle.len > 0);
     if (expected_count == 0) return true;
@@ -1639,6 +1655,34 @@ test containsAtLeast {
 
     try testing.expect(containsAtLeast(u8, "   radar      radar   ", 2, "radar"));
     try testing.expect(!containsAtLeast(u8, "   radar      radar   ", 3, "radar"));
+}
+
+/// Returns true if the haystack contains expected_count or more needles
+//
+/// See also: `containsAtLeast`
+pub fn containsAtLeastScalar(comptime T: type, haystack: []const T, expected_count: usize, needle: T) bool {
+    if (expected_count == 0) return true;
+
+    var found: usize = 0;
+
+    for (haystack) |item| {
+        if (item == needle) {
+            found += 1;
+            if (found == expected_count) return true;
+        }
+    }
+
+    return false;
+}
+
+test containsAtLeastScalar {
+    try testing.expect(containsAtLeastScalar(u8, "aa", 0, 'a'));
+    try testing.expect(containsAtLeastScalar(u8, "aa", 1, 'a'));
+    try testing.expect(containsAtLeastScalar(u8, "aa", 2, 'a'));
+    try testing.expect(!containsAtLeastScalar(u8, "aa", 3, 'a'));
+
+    try testing.expect(containsAtLeastScalar(u8, "adadda", 3, 'd'));
+    try testing.expect(!containsAtLeastScalar(u8, "adadda", 4, 'd'));
 }
 
 /// Reads an integer from memory with size equal to bytes.len.
@@ -4175,10 +4219,11 @@ fn BytesAsSliceReturnType(comptime T: type, comptime bytesType: type) type {
 
 /// Given a slice of bytes, returns a slice of the specified type
 /// backed by those bytes, preserving pointer attributes.
+/// If `T` is zero-bytes sized, the returned slice has a len of zero.
 pub fn bytesAsSlice(comptime T: type, bytes: anytype) BytesAsSliceReturnType(T, @TypeOf(bytes)) {
     // let's not give an undefined pointer to @ptrCast
     // it may be equal to zero and fail a null check
-    if (bytes.len == 0) {
+    if (bytes.len == 0 or @sizeOf(T) == 0) {
         return &[0]T{};
     }
 
@@ -4254,6 +4299,19 @@ test "bytesAsSlice preserves pointer attributes" {
     try testing.expectEqual(in.is_volatile, out.is_volatile);
     try testing.expectEqual(in.is_allowzero, out.is_allowzero);
     try testing.expectEqual(in.alignment, out.alignment);
+}
+
+test "bytesAsSlice with zero-bit element type" {
+    {
+        const bytes = [_]u8{};
+        const slice = bytesAsSlice(void, &bytes);
+        try testing.expectEqual(0, slice.len);
+    }
+    {
+        const bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+        const slice = bytesAsSlice(u0, &bytes);
+        try testing.expectEqual(0, slice.len);
+    }
 }
 
 fn SliceAsBytesReturnType(comptime Slice: type) type {
@@ -4604,11 +4662,6 @@ test "read/write(Var)PackedInt" {
         // LLVM backend fails with "too many locals: locals exceed maximum"
         .wasm32, .wasm64 => return error.SkipZigTest,
         else => {},
-    }
-
-    if (builtin.cpu.arch == .powerpc) {
-        // https://github.com/ziglang/zig/issues/16951
-        return error.SkipZigTest;
     }
 
     const foreign_endian: Endian = if (native_endian == .big) .little else .big;

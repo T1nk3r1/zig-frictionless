@@ -261,7 +261,7 @@ test containerLayout {
     try testing.expect(containerLayout(U3) == .@"extern");
 }
 
-/// Instead of this function, prefer to use e.g. `@typeInfo(foo).Struct.decls`
+/// Instead of this function, prefer to use e.g. `@typeInfo(foo).@"struct".decls`
 /// directly when you know what kind of type it is.
 pub fn declarations(comptime T: type) []const Type.Declaration {
     return switch (@typeInfo(T)) {
@@ -693,8 +693,10 @@ test activeTag {
     try testing.expect(activeTag(u) == UE.Float);
 }
 
+/// Deprecated: Use @FieldType(U, tag_name)
 const TagPayloadType = TagPayload;
 
+/// Deprecated: Use @FieldType(U, tag_name)
 pub fn TagPayloadByName(comptime U: type, comptime tag_name: []const u8) type {
     const info = @typeInfo(U).@"union";
 
@@ -706,8 +708,7 @@ pub fn TagPayloadByName(comptime U: type, comptime tag_name: []const u8) type {
     @compileError("no field '" ++ tag_name ++ "' in union '" ++ @typeName(U) ++ "'");
 }
 
-/// Given a tagged union type, and an enum, return the type of the union field
-/// corresponding to the enum tag.
+/// Deprecated: Use @FieldType(U, @tagName(tag))
 pub fn TagPayload(comptime U: type, comptime tag: Tag(U)) type {
     return TagPayloadByName(U, @tagName(tag));
 }

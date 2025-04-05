@@ -314,7 +314,7 @@ pub extern "kernel32" fn CreateProcessW(
     lpProcessAttributes: ?*SECURITY_ATTRIBUTES,
     lpThreadAttributes: ?*SECURITY_ATTRIBUTES,
     bInheritHandles: BOOL,
-    dwCreationFlags: DWORD,
+    dwCreationFlags: windows.CreateProcessFlags,
     lpEnvironment: ?LPVOID,
     lpCurrentDirectory: ?LPCWSTR,
     lpStartupInfo: *STARTUPINFOW,
@@ -655,10 +655,5 @@ pub extern "kernel32" fn SetLastError(
 ) callconv(.winapi) void;
 
 // Everything Else
-
-// TODO:
-//  Wrapper around KUSER_SHARED_DATA.SystemTime.
-//  Much better to use NtQuerySystemTime or NtQuerySystemTimePrecise for guaranteed 0.1ns precision.
-pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *FILETIME) callconv(.winapi) void;
 
 pub extern "kernel32" fn GetSystemInfo(lpSystemInfo: *SYSTEM_INFO) callconv(.winapi) void;

@@ -482,22 +482,22 @@ pub const O = switch (native_arch) {
 /// Set by startup code, used by `getauxval`.
 pub var elf_aux_maybe: ?[*]std.elf.Auxv = null;
 
+/// Whether an external or internal getauxval implementation is used.
 const extern_getauxval = switch (builtin.zig_backend) {
     // Calling extern functions is not yet supported with these backends
     .stage2_aarch64, .stage2_arm, .stage2_riscv64, .stage2_sparc64 => false,
     else => !builtin.link_libc,
 };
 
-comptime {
-    const root = @import("root");
-    // Export this only when building executable, otherwise it is overriding
-    // the libc implementation
-    if (extern_getauxval and (builtin.output_mode == .Exe or @hasDecl(root, "main"))) {
-        @export(&getauxvalImpl, .{ .name = "getauxval", .linkage = .weak });
-    }
-}
-
 pub const getauxval = if (extern_getauxval) struct {
+    comptime {
+        const root = @import("root");
+        // Export this only when building an executable, otherwise it is overriding
+        // the libc implementation
+        if (builtin.output_mode == .Exe or @hasDecl(root, "main")) {
+            @export(&getauxvalImpl, .{ .name = "getauxval", .linkage = .weak });
+        }
+    }
     extern fn getauxval(index: usize) usize;
 }.getauxval else getauxvalImpl;
 
@@ -3622,6 +3622,30 @@ pub const TCP = struct {
     pub const REPAIR_OFF_NO_WP = -1;
 };
 
+pub const UDP = struct {
+    /// Never send partially complete segments
+    pub const CORK = 1;
+    /// Set the socket to accept encapsulated packets
+    pub const ENCAP = 100;
+    /// Disable sending checksum for UDP6X
+    pub const NO_CHECK6_TX = 101;
+    /// Disable accepting checksum for UDP6
+    pub const NO_CHECK6_RX = 102;
+    /// Set GSO segmentation size
+    pub const SEGMENT = 103;
+    /// This socket can receive UDP GRO packets
+    pub const GRO = 104;
+};
+
+pub const UDP_ENCAP = struct {
+    pub const ESPINUDP_NON_IKE = 1;
+    pub const ESPINUDP = 2;
+    pub const L2TPINUDP = 3;
+    pub const GTP0 = 4;
+    pub const GTP1U = 5;
+    pub const RXRPC = 6;
+};
+
 pub const PF = struct {
     pub const UNSPEC = 0;
     pub const LOCAL = 1;
@@ -5127,7 +5151,6 @@ pub const NSIG = if (is_mips) 128 else 65;
 pub const sigset_t = [1024 / 32]u32;
 
 pub const all_mask: sigset_t = [_]u32{0xffffffff} ** @typeInfo(sigset_t).array.len;
-pub const app_mask: sigset_t = [2]u32{ 0xfffffffc, 0x7fffffff } ++ [_]u32{0xffffffff} ** 30;
 
 const k_sigaction_funcs = struct {
     const handler = ?*align(1) const fn (i32) callconv(.c) void;
@@ -5782,6 +5805,9 @@ pub const IORING_OP = enum(u8) {
     FUTEX_WAITV,
     FIXED_FD_INSTALL,
     FTRUNCATE,
+    BIND,
+    LISTEN,
+    RECV_ZC,
 
     _,
 };
@@ -5839,6 +5865,11 @@ pub const IORING_RECV_MULTISHOT = 1 << 1;
 pub const IORING_RECVSEND_FIXED_BUF = 1 << 2;
 /// If set, SEND[MSG]_ZC should report the zerocopy usage in cqe.res for the IORING_CQE_F_NOTIF cqe.
 pub const IORING_SEND_ZC_REPORT_USAGE = 1 << 3;
+/// If set, send or recv will grab as many buffers from the buffer group ID given and send them all.
+/// The completion result will be the number of buffers send, with the starting buffer ID in cqe as per usual.
+/// The buffers be contigious from the starting buffer ID.
+/// Used with IOSQE_BUFFER_SELECT.
+pub const IORING_RECVSEND_BUNDLE = 1 << 4;
 /// CQE.RES FOR IORING_CQE_F_NOTIF if IORING_SEND_ZC_REPORT_USAGE was requested
 pub const IORING_NOTIF_USAGE_ZC_COPIED = 1 << 31;
 
@@ -5901,6 +5932,8 @@ pub const IORING_CQE_F_MORE = 1 << 1;
 pub const IORING_CQE_F_SOCK_NONEMPTY = 1 << 2;
 /// Set for notification CQEs. Can be used to distinct them from sends.
 pub const IORING_CQE_F_NOTIF = 1 << 3;
+/// If set, the buffer ID set in the completion will get more completions.
+pub const IORING_CQE_F_BUF_MORE = 1 << 4;
 
 pub const IORING_CQE_BUFFER_SHIFT = 16;
 
@@ -6106,26 +6139,32 @@ pub const IO_URING_OP_SUPPORTED = 1 << 0;
 
 pub const io_uring_probe_op = extern struct {
     op: IORING_OP,
-
     resv: u8,
-
     /// IO_URING_OP_* flags
     flags: u16,
-
     resv2: u32,
+
+    pub fn is_supported(self: @This()) bool {
+        return self.flags & IO_URING_OP_SUPPORTED != 0;
+    }
 };
 
 pub const io_uring_probe = extern struct {
-    /// last opcode supported
+    /// Last opcode supported
     last_op: IORING_OP,
-
-    /// Number of io_uring_probe_op following
+    /// Length of ops[] array below
     ops_len: u8,
-
     resv: u16,
     resv2: [3]u32,
+    ops: [256]io_uring_probe_op,
 
-    // Followed by up to `ops_len` io_uring_probe_op structures
+    /// Is the operation supported on the running kernel.
+    pub fn is_supported(self: @This(), op: IORING_OP) bool {
+        const i = @intFromEnum(op);
+        if (i > @intFromEnum(self.last_op) or i >= self.ops_len)
+            return false;
+        return self.ops[i].is_supported();
+    }
 };
 
 pub const io_uring_restriction = extern struct {
@@ -6161,6 +6200,13 @@ pub const IORING_RESTRICTION = enum(u16) {
     _,
 };
 
+pub const IO_URING_SOCKET_OP = enum(u16) {
+    SIOCIN = 0,
+    SIOCOUTQ = 1,
+    GETSOCKOPT = 2,
+    SETSOCKOPT = 3,
+};
+
 pub const io_uring_buf = extern struct {
     addr: u64,
     len: u32,
@@ -6180,8 +6226,15 @@ pub const io_uring_buf_reg = extern struct {
     ring_addr: u64,
     ring_entries: u32,
     bgid: u16,
-    pad: u16,
+    flags: Flags,
     resv: [3]u64,
+
+    pub const Flags = packed struct {
+        _0: u1 = 0,
+        /// Incremental buffer consumption.
+        inc: bool,
+        _: u14 = 0,
+    };
 };
 
 pub const io_uring_getevents_arg = extern struct {

@@ -54,6 +54,10 @@ pub fn FullPanic(comptime panicFn: fn ([]const u8, ?usize) noreturn) type {
                 @tagName(accessed), @tagName(active),
             });
         }
+        pub fn sliceCastLenRemainder(src_len: usize) noreturn {
+            @branchHint(.cold);
+            std.debug.panicExtra(@returnAddress(), "slice length '{d}' does not divide exactly into destination elements", .{src_len});
+        }
         pub fn reachedUnreachable() noreturn {
             @branchHint(.cold);
             call("reached unreachable code", @returnAddress());
@@ -179,9 +183,11 @@ pub const sys_can_stack_trace = switch (builtin.cpu.arch) {
 
     // `@returnAddress()` in LLVM 10 gives
     // "Non-Emscripten WebAssembly hasn't implemented __builtin_return_address".
+    // On Emscripten, Zig only supports `@returnAddress()` in debug builds
+    // because Emscripten's implementation is very slow.
     .wasm32,
     .wasm64,
-    => native_os == .emscripten,
+    => native_os == .emscripten and builtin.mode == .Debug,
 
     // `@returnAddress()` is unsupported in LLVM 13.
     .bpfel,
@@ -240,10 +246,14 @@ pub fn dumpHexFallible(bytes: []const u8) !void {
     const stderr = std.io.getStdErr();
     const ttyconf = std.io.tty.detectConfig(stderr);
     const writer = stderr.writer();
+    try dumpHexInternal(bytes, ttyconf, writer);
+}
+
+fn dumpHexInternal(bytes: []const u8, ttyconf: std.io.tty.Config, writer: anytype) !void {
     var chunks = mem.window(u8, bytes, 16, 16);
     while (chunks.next()) |window| {
         // 1. Print the address.
-        const address = (@intFromPtr(bytes.ptr) + 0x10 * (chunks.index orelse 0) / 16) - 0x10;
+        const address = (@intFromPtr(bytes.ptr) + 0x10 * (std.math.divCeil(usize, chunks.index orelse bytes.len, 16) catch unreachable)) - 0x10;
         try ttyconf.setColor(writer, .dim);
         // We print the address in lowercase and the bytes in uppercase hexadecimal to distinguish them more.
         // Also, make sure all lines are aligned by padding the address.
@@ -288,11 +298,29 @@ pub fn dumpHexFallible(bytes: []const u8) !void {
     }
 }
 
+test dumpHexInternal {
+    const bytes: []const u8 = &.{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x12, 0x13 };
+    var output = std.ArrayList(u8).init(std.testing.allocator);
+    defer output.deinit();
+    try dumpHexInternal(bytes, .no_color, output.writer());
+    const expected = try std.fmt.allocPrint(std.testing.allocator,
+        \\{x:0>[2]}  00 11 22 33 44 55 66 77  88 99 AA BB CC DD EE FF  .."3DUfw........
+        \\{x:0>[2]}  01 12 13                                          ...
+        \\
+    , .{
+        @intFromPtr(bytes.ptr),
+        @intFromPtr(bytes.ptr) + 16,
+        @sizeOf(usize) * 2,
+    });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, output.items);
+}
+
 /// Tries to print the current stack trace to stderr, unbuffered, and ignores any error returned.
 /// TODO multithreaded awareness
 pub fn dumpCurrentStackTrace(start_addr: ?usize) void {
     nosuspend {
-        if (builtin.target.isWasm()) {
+        if (builtin.target.cpu.arch.isWasm()) {
             if (native_os == .wasi) {
                 const stderr = io.getStdErr().writer();
                 stderr.print("Unable to dump stack trace: not implemented for Wasm\n", .{}) catch return;
@@ -380,7 +408,7 @@ pub inline fn getContext(context: *ThreadContext) bool {
 /// TODO multithreaded awareness
 pub fn dumpStackTraceFromBase(context: *ThreadContext) void {
     nosuspend {
-        if (builtin.target.isWasm()) {
+        if (builtin.target.cpu.arch.isWasm()) {
             if (native_os == .wasi) {
                 const stderr = io.getStdErr().writer();
                 stderr.print("Unable to dump stack trace: not implemented for Wasm\n", .{}) catch return;
@@ -478,7 +506,7 @@ pub fn captureStackTrace(first_address: ?usize, stack_trace: *std.builtin.StackT
 /// TODO multithreaded awareness
 pub fn dumpStackTrace(stack_trace: std.builtin.StackTrace) void {
     nosuspend {
-        if (builtin.target.isWasm()) {
+        if (builtin.target.cpu.arch.isWasm()) {
             if (native_os == .wasi) {
                 const stderr = io.getStdErr().writer();
                 stderr.print("Unable to dump stack trace: not implemented for Wasm\n", .{}) catch return;
@@ -601,9 +629,9 @@ pub fn defaultPanic(
             // isn't visible on actual hardware if directly booted into
             inline for ([_]?*uefi.protocol.SimpleTextOutput{ uefi.system_table.std_err, uefi.system_table.con_out }) |o| {
                 if (o) |out| {
-                    _ = out.setAttribute(uefi.protocol.SimpleTextOutput.red);
-                    _ = out.outputString(exit_msg);
-                    _ = out.setAttribute(uefi.protocol.SimpleTextOutput.white);
+                    out.setAttribute(.{ .foreground = .red }) catch {};
+                    _ = out.outputString(exit_msg) catch {};
+                    out.setAttribute(.{ .foreground = .white }) catch {};
                 }
             }
 
@@ -611,7 +639,7 @@ pub fn defaultPanic(
                 // ExitData buffer must be allocated using boot_services.allocatePool (spec: page 220)
                 const exit_data: []u16 = uefi.raw_pool_allocator.alloc(u16, exit_msg.len + 1) catch @trap();
                 @memcpy(exit_data, exit_msg[0..exit_data.len]); // Includes null terminator.
-                _ = bs.exit(uefi.handle, .Aborted, exit_data.len, exit_data.ptr);
+                _ = bs.exit(uefi.handle, .aborted, exit_data.len, exit_data.ptr);
             }
             @trap();
         },
@@ -759,7 +787,7 @@ pub const StackIterator = struct {
     pub fn initWithContext(first_address: ?usize, debug_info: *SelfInfo, context: *posix.ucontext_t) !StackIterator {
         // The implementation of DWARF unwinding on aarch64-macos is not complete. However, Apple mandates that
         // the frame pointer register is always used, so on this platform we can safely use the FP-based unwinder.
-        if (builtin.target.isDarwin() and native_arch == .aarch64)
+        if (builtin.target.os.tag.isDarwin() and native_arch == .aarch64)
             return init(first_address, @truncate(context.mcontext.ss.fp));
 
         if (SelfInfo.supports_unwinding) {

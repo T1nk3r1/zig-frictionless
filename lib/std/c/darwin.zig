@@ -979,7 +979,7 @@ pub const kevent64_s = extern struct {
 // to make sure the struct is laid out the same. These values were
 // produced from C code using the offsetof macro.
 comptime {
-    if (builtin.target.isDarwin()) {
+    if (builtin.target.os.tag.isDarwin()) {
         assert(@offsetOf(kevent64_s, "ident") == 0);
         assert(@offsetOf(kevent64_s, "filter") == 8);
         assert(@offsetOf(kevent64_s, "flags") == 10);
@@ -1165,6 +1165,8 @@ pub const CPUFAMILY = enum(u32) {
     ARM_PALMA = 0x72015832,
     ARM_DONAN = 0x6f5129ac,
     ARM_BRAVA = 0x17d5b93a,
+    ARM_TAHITI = 0x75d4acb9,
+    ARM_TUPAI = 0x204526d0,
     _,
 };
 

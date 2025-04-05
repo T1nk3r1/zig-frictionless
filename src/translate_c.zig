@@ -325,7 +325,7 @@ fn declVisitorNamesOnly(c: *Context, decl: *const clang.Decl) Error!void {
 fn declVisitor(c: *Context, decl: *const clang.Decl) Error!void {
     switch (decl.getKind()) {
         .Function => {
-            return visitFnDecl(c, @as(*const clang.FunctionDecl, @ptrCast(decl)));
+            return transFnDecl(c, &c.global_scope.base, @as(*const clang.FunctionDecl, @ptrCast(decl)));
         },
         .Typedef => {
             try transTypeDef(c, &c.global_scope.base, @as(*const clang.TypedefNameDecl, @ptrCast(decl)));
@@ -367,7 +367,7 @@ fn transFileScopeAsm(c: *Context, scope: *Scope, file_scope_asm: *const clang.Fi
     try scope.appendNode(comptime_node);
 }
 
-fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
+fn transFnDecl(c: *Context, scope: *Scope, fn_decl: *const clang.FunctionDecl) Error!void {
     const fn_name = try c.str(@as(*const clang.NamedDecl, @ptrCast(fn_decl)).getName_bytes_begin());
     if (c.global_scope.sym_table.contains(fn_name))
         return; // Avoid processing this decl twice
@@ -375,7 +375,7 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
     // Skip this declaration if a proper definition exists
     if (!fn_decl.isThisDeclarationADefinition()) {
         if (fn_decl.getDefinition()) |def|
-            return visitFnDecl(c, def);
+            return transFnDecl(c, scope, def);
     }
 
     const fn_decl_loc = fn_decl.getLocation();
@@ -446,6 +446,9 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
     };
 
     if (!decl_ctx.has_body) {
+        if (scope.id != .root) {
+            return addLocalExternFnDecl(c, scope, fn_name, Node.initPayload(&proto_node.base));
+        }
         return addTopLevelDecl(c, fn_name, Node.initPayload(&proto_node.base));
     }
 
@@ -455,7 +458,7 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
     block_scope.return_type = return_qt;
     defer block_scope.deinit();
 
-    const scope = &block_scope.base;
+    const top_scope = &block_scope.base;
 
     var param_id: c_uint = 0;
     for (proto_node.data.params) |*param| {
@@ -508,7 +511,7 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
             break :blk;
         }
 
-        const rhs = transZeroInitExpr(c, scope, fn_decl_loc, return_qt.getTypePtr()) catch |err| switch (err) {
+        const rhs = transZeroInitExpr(c, top_scope, fn_decl_loc, return_qt.getTypePtr()) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.UnsupportedTranslation,
             error.UnsupportedType,
@@ -1874,7 +1877,7 @@ fn transDeclStmtOne(
             try transEnumDecl(c, scope, @as(*const clang.EnumDecl, @ptrCast(decl)));
         },
         .Function => {
-            try visitFnDecl(c, @as(*const clang.FunctionDecl, @ptrCast(decl)));
+            try transFnDecl(c, scope, @as(*const clang.FunctionDecl, @ptrCast(decl)));
         },
         else => {
             const decl_name = try c.str(decl.getDeclKindName());
@@ -1903,11 +1906,19 @@ fn transDeclRefExpr(
     const name = try c.str(@as(*const clang.NamedDecl, @ptrCast(value_decl)).getName_bytes_begin());
     const mangled_name = scope.getAlias(name);
     const decl_is_var = @as(*const clang.Decl, @ptrCast(value_decl)).getKind() == .Var;
-    const potential_local_extern = if (decl_is_var) ((@as(*const clang.VarDecl, @ptrCast(value_decl)).getStorageClass() == .Extern) and (scope.id != .root)) else false;
+    const storage_class = @as(*const clang.VarDecl, @ptrCast(value_decl)).getStorageClass();
+    const potential_local_extern = if (decl_is_var) ((storage_class == .Extern) and (scope.id != .root)) else false;
 
     var confirmed_local_extern = false;
+    var confirmed_local_extern_fn = false;
     var ref_expr = val: {
         if (cIsFunctionDeclRef(@as(*const clang.Expr, @ptrCast(expr)))) {
+            if (scope.id != .root) {
+                if (scope.getLocalExternAlias(name)) |v| {
+                    confirmed_local_extern_fn = true;
+                    break :val try Tag.identifier.create(c.arena, v);
+                }
+            }
             break :val try Tag.fn_identifier.create(c.arena, mangled_name);
         } else if (potential_local_extern) {
             if (scope.getLocalExternAlias(name)) |v| {
@@ -1934,6 +1945,11 @@ fn transDeclRefExpr(
                 .field_name = name, // by necessity, name will always == mangled_name
             });
         }
+    } else if (confirmed_local_extern_fn) {
+        ref_expr = try Tag.field_access.create(c.arena, .{
+            .lhs = ref_expr,
+            .field_name = name, // by necessity, name will always == mangled_name
+        });
     }
     scope.skipVariableDiscard(mangled_name);
     return ref_expr;
@@ -1964,7 +1980,14 @@ fn transImplicitCastExpr(
                 return maybeSuppressResult(c, result_used, sub_expr_node);
             }
 
-            const addr = try Tag.address_of.create(c.arena, sub_expr_node);
+            const index_val = try Tag.integer_literal.create(c.arena, "0");
+            const index = try Tag.as.create(c.arena, .{
+                .lhs = try Tag.type.create(c.arena, "usize"),
+                .rhs = try Tag.int_cast.create(c.arena, index_val),
+            });
+            const array0_node = try Tag.array_access.create(c.arena, .{ .lhs = sub_expr_node, .rhs = index });
+            // Convert array to pointer by expression: addr = &sub_expr[0]
+            const addr = try Tag.address_of.create(c.arena, array0_node);
             const casted = try transCPtrCast(c, scope, expr.getBeginLoc(), dest_type, src_type, addr);
             return maybeSuppressResult(c, result_used, casted);
         },
@@ -2570,9 +2593,9 @@ fn transInitListExprRecord(
     // Unions and Structs are both represented as RecordDecl
     const record_ty = ty.getAsRecordType() orelse
         blk: {
-        is_union_type = true;
-        break :blk ty.getAsUnionType();
-    } orelse unreachable;
+            is_union_type = true;
+            break :blk ty.getAsUnionType();
+        } orelse unreachable;
     const record_decl = record_ty.getDecl();
     const record_def = record_decl.getDefinition() orelse
         unreachable;
@@ -4006,7 +4029,7 @@ fn transCPtrCast(
     if (!src_ty.isArrayType() and ((src_child_type.isConstQualified() and
         !child_type.isConstQualified()) or
         (src_child_type.isVolatileQualified() and
-        !child_type.isVolatileQualified())))
+            !child_type.isVolatileQualified())))
     {
         return removeCVQualifiers(c, dst_type_node, expr);
     } else {
@@ -4092,8 +4115,8 @@ fn transFloatingLiteralQuad(c: *Context, expr: *const clang.FloatingLiteral, use
             false;
         break :fmt_decimal if (could_roundtrip) try c.arena.dupe(u8, temp_str) else null;
     }
-    // otherwise, fall back to the hexadecimal format
-    orelse try std.fmt.allocPrint(c.arena, "{x}", .{quad});
+        // otherwise, fall back to the hexadecimal format
+        orelse try std.fmt.allocPrint(c.arena, "{x}", .{quad});
 
     var node = try Tag.float_literal.create(c.arena, str);
     if (is_negative) node = try Tag.negate.create(c.arena, node);
@@ -4204,6 +4227,23 @@ fn addTopLevelDecl(c: *Context, name: []const u8, decl_node: Node) !void {
         gop.value_ptr.* = decl_node;
         try c.global_scope.nodes.append(decl_node);
     }
+}
+
+/// Add an "extern" function prototype declaration that's been declared within a scoped block.
+/// Similar to static local variables, this will be wrapped in a struct to work with Zig's syntax requirements.
+///
+fn addLocalExternFnDecl(c: *Context, scope: *Scope, name: []const u8, decl_node: Node) !void {
+    const bs: *Scope.Block = try scope.findBlockScope(c);
+
+    // Special naming convention for local extern function wrapper struct,
+    // this named "ExternLocal_[name]".
+    const struct_name = try std.fmt.allocPrint(c.arena, "{s}_{s}", .{ Scope.Block.extern_inner_prepend, name });
+
+    // Outer Node for the wrapper struct
+    const node = try Tag.extern_local_fn.create(c.arena, .{ .name = struct_name, .init = decl_node });
+
+    try bs.statements.append(node);
+    try bs.discardVariable(c, struct_name);
 }
 
 fn transQualTypeInitializedStringLiteral(c: *Context, elem_ty: Node, string_lit: *const clang.StringLiteral) TypeError!Node {
@@ -5080,15 +5120,14 @@ fn finishTransFnProto(
         const is_noalias = param_qt.isRestrictQualified();
 
         const param_name: ?[]const u8 =
-            if (fn_decl) |decl|
-        blk: {
-            const param = decl.getParamDecl(@as(c_uint, @intCast(i)));
-            const param_name: []const u8 = try c.str(@as(*const clang.NamedDecl, @ptrCast(param)).getName_bytes_begin());
-            if (param_name.len < 1)
-                break :blk null;
+            if (fn_decl) |decl| blk: {
+                const param = decl.getParamDecl(@as(c_uint, @intCast(i)));
+                const param_name: []const u8 = try c.str(@as(*const clang.NamedDecl, @ptrCast(param)).getName_bytes_begin());
+                if (param_name.len < 1)
+                    break :blk null;
 
-            break :blk param_name;
-        } else null;
+                break :blk param_name;
+            } else null;
         const type_node = try transQualType(c, scope, param_qt, source_loc);
 
         fn_params.addOneAssumeCapacity().* = .{

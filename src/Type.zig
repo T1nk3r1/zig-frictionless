@@ -604,12 +604,20 @@ pub fn hasRuntimeBitsInner(
                         // and then later if our guess was incorrect, we emit a compile error.
                         if (union_type.assumeRuntimeBitsIfFieldTypesWip(ip)) return true;
                     },
+                    .safety, .tagged => {},
+                }
+                switch (strat) {
+                    .sema => try ty.resolveFields(strat.pt(zcu, tid)),
+                    .eager => assert(union_flags.status.haveFieldTypes()),
+                    .lazy => if (!union_flags.status.haveFieldTypes())
+                        return error.NeedLazy,
+                }
+                switch (union_flags.runtime_tag) {
+                    .none => {},
                     .safety, .tagged => {
                         const tag_ty = union_type.tagTypeUnordered(ip);
-                        // tag_ty will be `none` if this union's tag type is not resolved yet,
-                        // in which case we want control flow to continue down below.
-                        if (tag_ty != .none and
-                            try Type.fromInterned(tag_ty).hasRuntimeBitsInner(
+                        assert(tag_ty != .none); // tag_ty should have been resolved above
+                        if (try Type.fromInterned(tag_ty).hasRuntimeBitsInner(
                             ignore_comptime_only,
                             strat,
                             zcu,
@@ -618,12 +626,6 @@ pub fn hasRuntimeBitsInner(
                             return true;
                         }
                     },
-                }
-                switch (strat) {
-                    .sema => try ty.resolveFields(strat.pt(zcu, tid)),
-                    .eager => assert(union_flags.status.haveFieldTypes()),
-                    .lazy => if (!union_flags.status.haveFieldTypes())
-                        return error.NeedLazy,
                 }
                 for (0..union_type.field_types.len) |field_index| {
                     const field_ty = Type.fromInterned(union_type.field_types.get(ip)[field_index]);
@@ -806,7 +808,7 @@ pub fn isNoReturn(ty: Type, zcu: *const Zcu) bool {
     return zcu.intern_pool.isNoReturn(ty.toIntern());
 }
 
-/// Returns `none` if the pointer is naturally aligned and the element type is 0-bit.
+/// Never returns `none`. Asserts that all necessary type resolution is already done.
 pub fn ptrAlignment(ty: Type, zcu: *Zcu) Alignment {
     return ptrAlignmentInner(ty, .normal, zcu, {}) catch unreachable;
 }
@@ -823,15 +825,9 @@ pub fn ptrAlignmentInner(
 ) !Alignment {
     return switch (zcu.intern_pool.indexToKey(ty.toIntern())) {
         .ptr_type => |ptr_type| {
-            if (ptr_type.flags.alignment != .none)
-                return ptr_type.flags.alignment;
-
-            if (strat == .sema) {
-                const res = try Type.fromInterned(ptr_type.child).abiAlignmentInner(.sema, zcu, tid);
-                return res.scalar;
-            }
-
-            return Type.fromInterned(ptr_type.child).abiAlignment(zcu);
+            if (ptr_type.flags.alignment != .none) return ptr_type.flags.alignment;
+            const res = try Type.fromInterned(ptr_type.child).abiAlignmentInner(strat.toLazy(), zcu, tid);
+            return res.scalar;
         },
         .opt_type => |child| Type.fromInterned(child).ptrAlignmentInner(strat, zcu, tid),
         else => unreachable,
@@ -1645,70 +1641,60 @@ pub fn intAbiAlignment(bits: u16, target: Target) Alignment {
 pub fn maxIntAlignment(target: std.Target) u16 {
     return switch (target.cpu.arch) {
         .avr => 1,
-        .msp430 => 2,
-        .xcore => 4,
-        .propeller1, .propeller2 => 4,
 
+        .msp430 => 2,
+
+        .xcore,
+        .propeller,
+        => 4,
+
+        .amdgcn,
         .arm,
         .armeb,
         .thumb,
         .thumbeb,
+        .lanai,
         .hexagon,
         .mips,
         .mipsel,
         .powerpc,
         .powerpcle,
-        .amdgcn,
         .riscv32,
-        .sparc,
         .s390x,
-        .lanai,
-        .wasm32,
-        .wasm64,
         => 8,
 
-        // For these, LLVMABIAlignmentOfType(i128) reports 8. Note that 16
-        // is a relevant number in three cases:
-        // 1. Different machine code instruction when loading into SIMD register.
-        // 2. The C ABI wants 16 for extern structs.
-        // 3. 16-byte cmpxchg needs 16-byte alignment.
-        // Same logic for powerpc64, mips64, sparc64.
-        .powerpc64,
-        .powerpc64le,
-        .mips64,
-        .mips64el,
-        .sparc64,
-        => switch (target.ofmt) {
-            .c => 16,
-            else => 8,
-        },
-
-        .x86_64 => 16,
-
         // Even LLVMABIAlignmentOfType(i128) agrees on these targets.
-        .x86,
         .aarch64,
         .aarch64_be,
-        .riscv64,
         .bpfel,
         .bpfeb,
+        .mips64,
+        .mips64el,
         .nvptx,
         .nvptx64,
+        .powerpc64,
+        .powerpc64le,
+        .riscv64,
+        .sparc,
+        .sparc64,
+        .wasm32,
+        .wasm64,
+        .x86,
+        .x86_64,
         => 16,
 
         // Below this comment are unverified but based on the fact that C requires
         // int128_t to be 16 bytes aligned, it's a safe default.
-        .spu_2,
-        .csky,
         .arc,
-        .m68k,
+        .csky,
         .kalimba,
-        .spirv,
-        .spirv32,
-        .ve,
-        .spirv64,
         .loongarch32,
         .loongarch64,
+        .m68k,
+        .spirv,
+        .spirv32,
+        .spirv64,
+        .ve,
         .xtensa,
         => 16,
     };
@@ -2540,6 +2526,13 @@ pub fn isValidReturnType(self: Type, zcu: *const Zcu) bool {
 /// Asserts the type is a function.
 pub fn fnIsVarArgs(ty: Type, zcu: *const Zcu) bool {
     return zcu.intern_pool.indexToKey(ty.toIntern()).func_type.is_var_args;
+}
+
+pub fn fnPtrMaskOrNull(ty: Type, zcu: *const Zcu) ?u64 {
+    return switch (ty.zigTypeTag(zcu)) {
+        .@"fn" => target_util.functionPointerMask(zcu.getTarget()),
+        else => null,
+    };
 }
 
 pub fn isNumeric(ty: Type, zcu: *const Zcu) bool {
@@ -3503,7 +3496,7 @@ pub fn srcLocOrNull(ty: Type, zcu: *Zcu) ?Zcu.LazySrcLoc {
             },
             else => return null,
         },
-        .offset = Zcu.LazySrcLoc.Offset.nodeOffset(0),
+        .offset = Zcu.LazySrcLoc.Offset.nodeOffset(.zero),
     };
 }
 
@@ -3587,7 +3580,10 @@ pub fn typeDeclSrcLine(ty: Type, zcu: *Zcu) ?u32 {
     };
     const info = tracked.resolveFull(&zcu.intern_pool) orelse return null;
     const file = zcu.fileByIndex(info.file);
-    const zir = file.zir.?;
+    const zir = switch (file.getMode()) {
+        .zig => file.zir.?,
+        .zon => return 0,
+    };
     const inst = zir.instructions.get(@intFromEnum(info.inst));
     return switch (inst.tag) {
         .struct_init, .struct_init_ref => zir.extraData(Zir.Inst.StructInit, inst.data.pl_node.payload_index).data.abs_line,
@@ -4190,15 +4186,19 @@ pub const @"c_longlong": Type = .{ .ip_index = .c_longlong_type };
 pub const @"c_ulonglong": Type = .{ .ip_index = .c_ulonglong_type };
 pub const @"c_longdouble": Type = .{ .ip_index = .c_longdouble_type };
 
-pub const slice_const_u8: Type = .{ .ip_index = .slice_const_u8_type };
 pub const manyptr_u8: Type = .{ .ip_index = .manyptr_u8_type };
-pub const single_const_pointer_to_comptime_int: Type = .{
-    .ip_index = .single_const_pointer_to_comptime_int_type,
-};
+pub const manyptr_const_u8: Type = .{ .ip_index = .manyptr_const_u8_type };
+pub const manyptr_const_u8_sentinel_0: Type = .{ .ip_index = .manyptr_const_u8_sentinel_0_type };
+pub const single_const_pointer_to_comptime_int: Type = .{ .ip_index = .single_const_pointer_to_comptime_int_type };
+pub const slice_const_u8: Type = .{ .ip_index = .slice_const_u8_type };
 pub const slice_const_u8_sentinel_0: Type = .{ .ip_index = .slice_const_u8_sentinel_0_type };
 
 pub const vector_16_i8: Type = .{ .ip_index = .vector_16_i8_type };
 pub const vector_32_i8: Type = .{ .ip_index = .vector_32_i8_type };
+pub const vector_1_u8: Type = .{ .ip_index = .vector_1_u8_type };
+pub const vector_2_u8: Type = .{ .ip_index = .vector_2_u8_type };
+pub const vector_4_u8: Type = .{ .ip_index = .vector_4_u8_type };
+pub const vector_8_u8: Type = .{ .ip_index = .vector_8_u8_type };
 pub const vector_16_u8: Type = .{ .ip_index = .vector_16_u8_type };
 pub const vector_32_u8: Type = .{ .ip_index = .vector_32_u8_type };
 pub const vector_8_i16: Type = .{ .ip_index = .vector_8_i16_type };
