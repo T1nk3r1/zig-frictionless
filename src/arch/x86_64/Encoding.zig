@@ -305,20 +305,20 @@ pub const Mnemonic = enum {
     jnc, jne, jng, jnge, jnl, jnle, jno, jnp, jns, jnz, jo, jp, jpe, jpo, jrcxz, js, jz,
     lahf, lar, lea, leave, lfence, lgdt, lidt, lldt, lmsw, loop, loope, loopne,
     lods, lodsb, lodsd, lodsq, lodsw,
-    lsl, ltr,
+    lsl, ltr, lzcnt,
     mfence, mov, movbe,
     movs, movsb, movsd, movsq, movsw,
     movsx, movsxd, movzx, mul,
     neg, nop, not,
     @"or", out, outs, outsb, outsd, outsw,
-    pause, pop, popf, popfd, popfq, push, pushfq,
+    pause, pop, popcnt, popf, popfd, popfq, push, pushfq,
     rcl, rcr,
     rdfsbase, rdgsbase, rdmsr, rdpid, rdpkru, rdpmc, rdrand, rdseed, rdssd, rdssq, rdtsc, rdtscp,
-    ret, rol, ror, rsm,
-    sahf, sal, sar, sbb,
+    ret, rol, ror, rorx, rsm,
+    sahf, sal, sar, sarx, sbb,
     scas, scasb, scasd, scasq, scasw,
     senduipi, serialize,
-    shl, shld, shr, shrd,
+    shl, shld, shlx, shr, shrd, shrx,
     stac, stc, std, sti, str, stui,
     sub, swapgs, syscall, sysenter, sysexit, sysret,
     seta, setae, setb, setbe, setc, sete, setg, setge, setl, setle, setna, setnae,
@@ -381,7 +381,7 @@ pub const Mnemonic = enum {
     sqrtps, sqrtss,
     stmxcsr,
     subps, subss,
-    ucomiss, unpckhps, unpcklps,
+    ucomiss,
     xorps,
     // SSE2
     addpd, addsd,
@@ -411,7 +411,7 @@ pub const Mnemonic = enum {
     shufpd,
     sqrtpd, sqrtsd,
     subpd, subsd,
-    ucomisd, unpckhpd, unpcklpd,
+    ucomisd,
     xorpd,
     // SSE3
     addsubpd, addsubps, haddpd, haddps, lddqu, movddup, movshdup, movsldup,
@@ -435,8 +435,6 @@ pub const Mnemonic = enum {
     roundpd, roundps, roundsd, roundss,
     // SSE4.2
     crc32, pcmpgtq,
-    // ABM
-    lzcnt, popcnt,
     // PCLMUL
     pclmulqdq,
     // AES
@@ -444,6 +442,7 @@ pub const Mnemonic = enum {
     // SHA
     sha1rnds4, sha1nexte, sha1msg1, sha1msg2, sha256msg1, sha256msg2, sha256rnds2,
     // AVX
+    andn, bextr, blsi, blsmsk, blsr, bzhi, tzcnt,
     vaddpd, vaddps, vaddsd, vaddss, vaddsubpd, vaddsubps,
     vaesdec, vaesdeclast, vaesenc, vaesenclast, vaesimc, vaeskeygenassist,
     vandnpd, vandnps, vandpd, vandps,
@@ -509,12 +508,8 @@ pub const Mnemonic = enum {
     vstmxcsr,
     vsubpd, vsubps, vsubsd, vsubss,
     vtestpd, vtestps,
-    vucomisd, vucomiss, vunpckhpd, vunpckhps, vunpcklpd, vunpcklps,
+    vucomisd, vucomiss,
     vxorpd, vxorps,
-    // BMI
-    andn, bextr, blsi, blsmsk, blsr, tzcnt,
-    // BMI2
-    bzhi, mulx, pdep, pext, rorx, sarx, shlx, shrx,
     // F16C
     vcvtph2ps, vcvtps2ph,
     // FMA
@@ -592,7 +587,6 @@ pub const Op = enum {
                         else => unreachable,
                     },
                 },
-                .gphi => .r8,
                 .segment => .sreg,
                 .x87 => switch (reg) {
                     .st0 => .st0,
@@ -1016,23 +1010,20 @@ fn estimateInstructionLength(prefix: Prefix, encoding: Encoding, ops: []const Op
 
 const mnemonic_to_encodings_map = init: {
     @setEvalBranchQuota(5_800);
-    const ModrmExt = u3;
-    const Entry = struct { Mnemonic, OpEn, []const Op, []const u8, ModrmExt, Mode, Feature };
-    const encodings: []const Entry = @import("encodings.zon");
-
     const mnemonic_count = @typeInfo(Mnemonic).@"enum".fields.len;
     var mnemonic_map: [mnemonic_count][]Data = @splat(&.{});
-    for (encodings) |entry| mnemonic_map[@intFromEnum(entry[0])].len += 1;
-    var data_storage: [encodings.len]Data = undefined;
+    const encodings = @import("encodings.zig");
+    for (encodings.table) |entry| mnemonic_map[@intFromEnum(entry[0])].len += 1;
+    var data_storage: [encodings.table.len]Data = undefined;
     var storage_i: usize = 0;
     for (&mnemonic_map) |*value| {
         value.ptr = data_storage[storage_i..].ptr;
         storage_i += value.len;
     }
     var mnemonic_i: [mnemonic_count]usize = @splat(0);
-    const ops_len = @typeInfo(@FieldType(Data, "ops")).array.len;
-    const opc_len = @typeInfo(@FieldType(Data, "opc")).array.len;
-    for (encodings) |entry| {
+    const ops_len = @typeInfo(std.meta.FieldType(Data, .ops)).array.len;
+    const opc_len = @typeInfo(std.meta.FieldType(Data, .opc)).array.len;
+    for (encodings.table) |entry| {
         const i = &mnemonic_i[@intFromEnum(entry[0])];
         mnemonic_map[@intFromEnum(entry[0])][i.*] = .{
             .op_en = entry[1],

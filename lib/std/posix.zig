@@ -281,7 +281,6 @@ pub fn close(fd: fd_t) void {
 
 pub const FChmodError = error{
     AccessDenied,
-    PermissionDenied,
     InputOutput,
     SymLinkLoop,
     FileNotFound,
@@ -311,7 +310,7 @@ pub fn fchmod(fd: fd_t, mode: mode_t) FChmodError!void {
             .NOENT => return error.FileNotFound,
             .NOMEM => return error.SystemResources,
             .NOTDIR => return error.FileNotFound,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .ROFS => return error.ReadOnlyFileSystem,
             else => |err| return unexpectedErrno(err),
         }
@@ -388,7 +387,7 @@ fn fchmodat1(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
             .NOTDIR => return error.FileNotFound,
             .NOMEM => return error.SystemResources,
             .OPNOTSUPP => return error.OperationNotSupported,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .ROFS => return error.ReadOnlyFileSystem,
             else => |err| return unexpectedErrno(err),
         }
@@ -419,7 +418,7 @@ fn fchmodat2(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
             .NOMEM => return error.SystemResources,
             .NOTDIR => return error.FileNotFound,
             .OPNOTSUPP => return error.OperationNotSupported,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .ROFS => return error.ReadOnlyFileSystem,
 
             .NOSYS => {
@@ -448,7 +447,7 @@ fn fchmodat2(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
             .FAULT => unreachable,
             .INVAL => unreachable,
             .ACCES => return error.AccessDenied,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .LOOP => return error.SymLinkLoop,
             .MFILE => return error.ProcessFdQuotaExceeded,
             .NAMETOOLONG => return error.NameTooLong,
@@ -487,7 +486,7 @@ fn fchmodat2(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
             .LOOP => return error.SymLinkLoop,
             .NOMEM => return error.SystemResources,
             .NOTDIR => return error.FileNotFound,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .ROFS => return error.ReadOnlyFileSystem,
             else => |err| return unexpectedErrno(err),
         }
@@ -496,7 +495,6 @@ fn fchmodat2(dirfd: fd_t, path: []const u8, mode: mode_t, flags: u32) FChmodAtEr
 
 pub const FChownError = error{
     AccessDenied,
-    PermissionDenied,
     InputOutput,
     SymLinkLoop,
     FileNotFound,
@@ -531,7 +529,7 @@ pub fn fchown(fd: fd_t, owner: ?uid_t, group: ?gid_t) FChownError!void {
             .NOENT => return error.FileNotFound,
             .NOMEM => return error.SystemResources,
             .NOTDIR => return error.FileNotFound,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .ROFS => return error.ReadOnlyFileSystem,
             else => |err| return unexpectedErrno(err),
         }
@@ -724,12 +722,9 @@ pub fn raise(sig: u8) RaiseError!void {
     }
 
     if (native_os == .linux) {
-        // https://git.musl-libc.org/cgit/musl/commit/?id=0bed7e0acfd34e3fb63ca0e4d99b7592571355a9
-        //
-        // Unlike musl, libc-less Zig std does not have any internal signals for implementation purposes, so we
-        // need to block all signals on the assumption that any of them could potentially fork() in a handler.
         var set: sigset_t = undefined;
-        sigprocmask(SIG.BLOCK, &linux.all_mask, &set);
+        // block application signals
+        sigprocmask(SIG.BLOCK, &linux.app_mask, &set);
 
         const tid = linux.gettid();
         const rc = linux.tkill(tid, sig);
@@ -780,7 +775,7 @@ pub fn exit(status: u8) noreturn {
             _ = bs.exit(uefi.handle, @enumFromInt(status), 0, null);
         }
         // If we can't exit, reboot the system instead.
-        uefi.system_table.runtime_services.resetSystem(.reset_cold, @enumFromInt(status), 0, null);
+        uefi.system_table.runtime_services.resetSystem(.ResetCold, @enumFromInt(status), 0, null);
     }
     system.exit(status);
 }
@@ -1036,19 +1031,17 @@ pub const TruncateError = error{
     FileTooBig,
     InputOutput,
     FileBusy,
+
+    /// In WASI, this error occurs when the file descriptor does
+    /// not hold the required rights to call `ftruncate` on it.
     AccessDenied,
-    PermissionDenied,
 } || UnexpectedError;
 
-/// Length must be positive when treated as an i64.
 pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
-    const signed_len: i64 = @bitCast(length);
-    if (signed_len < 0) return error.FileTooBig; // avoid ambiguous EINVAL errors
-
     if (native_os == .windows) {
         var io_status_block: windows.IO_STATUS_BLOCK = undefined;
         var eof_info = windows.FILE_END_OF_FILE_INFORMATION{
-            .EndOfFile = signed_len,
+            .EndOfFile = @bitCast(length),
         };
 
         const rc = windows.ntdll.NtSetInformationFile(
@@ -1063,8 +1056,6 @@ pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
             .SUCCESS => return,
             .INVALID_HANDLE => unreachable, // Handle not open for writing
             .ACCESS_DENIED => return error.AccessDenied,
-            .USER_MAPPED_FILE => return error.AccessDenied,
-            .INVALID_PARAMETER => return error.FileTooBig,
             else => return windows.unexpectedStatus(rc),
         }
     }
@@ -1074,10 +1065,10 @@ pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
             .INTR => unreachable,
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .TXTBSY => return error.FileBusy,
             .BADF => unreachable, // Handle not open for writing
-            .INVAL => unreachable, // Handle not open for writing, negative length, or non-resizable handle
+            .INVAL => unreachable, // Handle not open for writing
             .NOTCAPABLE => return error.AccessDenied,
             else => |err| return unexpectedErrno(err),
         }
@@ -1085,15 +1076,15 @@ pub fn ftruncate(fd: fd_t, length: u64) TruncateError!void {
 
     const ftruncate_sym = if (lfs64_abi) system.ftruncate64 else system.ftruncate;
     while (true) {
-        switch (errno(ftruncate_sym(fd, signed_len))) {
+        switch (errno(ftruncate_sym(fd, @bitCast(length)))) {
             .SUCCESS => return,
             .INTR => continue,
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .TXTBSY => return error.FileBusy,
             .BADF => unreachable, // Handle not open for writing
-            .INVAL => unreachable, // Handle not open for writing, negative length, or non-resizable handle
+            .INVAL => unreachable, // Handle not open for writing
             else => |err| return unexpectedErrno(err),
         }
     }
@@ -1184,7 +1175,6 @@ pub const WriteError = error{
 
     /// File descriptor does not hold the required rights to write to it.
     AccessDenied,
-    PermissionDenied,
     BrokenPipe,
     SystemResources,
     OperationAborted,
@@ -1207,10 +1197,6 @@ pub const WriteError = error{
     /// This error occurs when a device gets disconnected before or mid-flush
     /// while it's being written to - errno(6): No such device or address.
     NoDevice,
-
-    /// The socket type requires that message be sent atomically, and the size of the message
-    /// to be sent made this impossible. The message is not transmitted.
-    MessageTooBig,
 } || UnexpectedError;
 
 /// Write to a file descriptor.
@@ -1259,7 +1245,7 @@ pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .NOTCAPABLE => return error.AccessDenied,
             else => |err| return unexpectedErrno(err),
@@ -1287,12 +1273,11 @@ pub fn write(fd: fd_t, bytes: []const u8) WriteError!usize {
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
             .ACCES => return error.AccessDenied,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .CONNRESET => return error.ConnectionResetByPeer,
             .BUSY => return error.DeviceBusy,
             .NXIO => return error.NoDevice,
-            .MSGSIZE => return error.MessageTooBig,
             else => |err| return unexpectedErrno(err),
         }
     }
@@ -1340,7 +1325,7 @@ pub fn writev(fd: fd_t, iov: []const iovec_const) WriteError!usize {
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .NOTCAPABLE => return error.AccessDenied,
             else => |err| return unexpectedErrno(err),
@@ -1362,7 +1347,7 @@ pub fn writev(fd: fd_t, iov: []const iovec_const) WriteError!usize {
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .CONNRESET => return error.ConnectionResetByPeer,
             .BUSY => return error.DeviceBusy,
@@ -1419,7 +1404,7 @@ pub fn pwrite(fd: fd_t, bytes: []const u8, offset: u64) PWriteError!usize {
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .NXIO => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -1452,7 +1437,7 @@ pub fn pwrite(fd: fd_t, bytes: []const u8, offset: u64) PWriteError!usize {
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .NXIO => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -1511,7 +1496,7 @@ pub fn pwritev(fd: fd_t, iov: []const iovec_const, offset: u64) PWriteError!usiz
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .NXIO => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -1537,7 +1522,7 @@ pub fn pwritev(fd: fd_t, iov: []const iovec_const, offset: u64) PWriteError!usiz
             .FBIG => return error.FileTooBig,
             .IO => return error.InputOutput,
             .NOSPC => return error.NoSpaceLeft,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .PIPE => return error.BrokenPipe,
             .NXIO => return error.Unseekable,
             .SPIPE => return error.Unseekable,
@@ -1552,7 +1537,6 @@ pub const OpenError = error{
     /// In WASI, this error may occur when the file descriptor does
     /// not hold the required rights to open a new resource relative to it.
     AccessDenied,
-    PermissionDenied,
     SymLinkLoop,
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
@@ -1670,7 +1654,7 @@ pub fn openZ(file_path: [*:0]const u8, flags: O, perm: mode_t) OpenError!fd_t {
             .NOMEM => return error.SystemResources,
             .NOSPC => return error.NoSpaceLeft,
             .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .EXIST => return error.PathAlreadyExists,
             .BUSY => return error.DeviceBusy,
             .ILSEQ => |err| if (native_os == .wasi)
@@ -1750,7 +1734,7 @@ pub fn openatWasi(
             .NOMEM => return error.SystemResources,
             .NOSPC => return error.NoSpaceLeft,
             .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .EXIST => return error.PathAlreadyExists,
             .BUSY => return error.DeviceBusy,
             .NOTCAPABLE => return error.AccessDenied,
@@ -1841,7 +1825,7 @@ pub fn openatZ(dir_fd: fd_t, file_path: [*:0]const u8, flags: O, mode: mode_t) O
             .NOMEM => return error.SystemResources,
             .NOSPC => return error.NoSpaceLeft,
             .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .EXIST => return error.PathAlreadyExists,
             .BUSY => return error.DeviceBusy,
             .OPNOTSUPP => return error.FileLocksNotSupported,
@@ -1883,7 +1867,6 @@ pub fn dup2(old_fd: fd_t, new_fd: fd_t) !void {
 pub const ExecveError = error{
     SystemResources,
     AccessDenied,
-    PermissionDenied,
     InvalidExe,
     FileSystem,
     IsDir,
@@ -1910,7 +1893,7 @@ pub fn execveZ(
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.SystemResources,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .INVAL => return error.InvalidExe,
         .NOEXEC => return error.InvalidExe,
         .IO => return error.FileSystem,
@@ -2088,7 +2071,6 @@ pub const SymLinkError = error{
     /// In WASI, this error may occur when the file descriptor does
     /// not hold the required rights to create a new symbolic link relative to it.
     AccessDenied,
-    PermissionDenied,
     DiskQuota,
     PathAlreadyExists,
     FileSystem,
@@ -2142,7 +2124,7 @@ pub fn symlinkZ(target_path: [*:0]const u8, sym_link_path: [*:0]const u8) SymLin
         .FAULT => unreachable,
         .INVAL => unreachable,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
         .IO => return error.FileSystem,
@@ -2190,7 +2172,7 @@ pub fn symlinkatWasi(target_path: []const u8, newdirfd: fd_t, sym_link_path: []c
         .INVAL => unreachable,
         .BADF => unreachable,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
         .IO => return error.FileSystem,
@@ -2220,7 +2202,7 @@ pub fn symlinkatZ(target_path: [*:0]const u8, newdirfd: fd_t, sym_link_path: [*:
         .FAULT => unreachable,
         .INVAL => unreachable,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
         .IO => return error.FileSystem,
@@ -2241,7 +2223,6 @@ pub fn symlinkatZ(target_path: [*:0]const u8, newdirfd: fd_t, sym_link_path: [*:
 
 pub const LinkError = UnexpectedError || error{
     AccessDenied,
-    PermissionDenied,
     DiskQuota,
     PathAlreadyExists,
     FileSystem,
@@ -2277,7 +2258,7 @@ pub fn linkZ(oldpath: [*:0]const u8, newpath: [*:0]const u8) LinkError!void {
         .NOENT => return error.FileNotFound,
         .NOMEM => return error.SystemResources,
         .NOSPC => return error.NoSpaceLeft,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .XDEV => return error.NotSameFileSystem,
         .INVAL => unreachable,
@@ -2331,7 +2312,7 @@ pub fn linkatZ(
         .NOMEM => return error.SystemResources,
         .NOSPC => return error.NoSpaceLeft,
         .NOTDIR => return error.NotDir,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .XDEV => return error.NotSameFileSystem,
         .INVAL => unreachable,
@@ -2380,7 +2361,7 @@ pub fn linkat(
             .NOMEM => return error.SystemResources,
             .NOSPC => return error.NoSpaceLeft,
             .NOTDIR => return error.NotDir,
-            .PERM => return error.PermissionDenied,
+            .PERM => return error.AccessDenied,
             .ROFS => return error.ReadOnlyFileSystem,
             .XDEV => return error.NotSameFileSystem,
             .INVAL => unreachable,
@@ -2399,7 +2380,6 @@ pub const UnlinkError = error{
     /// In WASI, this error may occur when the file descriptor does
     /// not hold the required rights to unlink a resource by path relative to it.
     AccessDenied,
-    PermissionDenied,
     FileBusy,
     FileSystem,
     IsDir,
@@ -2455,7 +2435,7 @@ pub fn unlinkZ(file_path: [*:0]const u8) UnlinkError!void {
     switch (errno(system.unlink(file_path))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .BUSY => return error.FileBusy,
         .FAULT => unreachable,
         .INVAL => unreachable,
@@ -2516,7 +2496,7 @@ pub fn unlinkatWasi(dirfd: fd_t, file_path: []const u8, flags: u32) UnlinkatErro
     switch (res) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .BUSY => return error.FileBusy,
         .FAULT => unreachable,
         .IO => return error.FileSystem,
@@ -2549,7 +2529,7 @@ pub fn unlinkatZ(dirfd: fd_t, file_path_c: [*:0]const u8, flags: u32) UnlinkatEr
     switch (errno(system.unlinkat(dirfd, file_path_c, flags))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .BUSY => return error.FileBusy,
         .FAULT => unreachable,
         .IO => return error.FileSystem,
@@ -2587,7 +2567,6 @@ pub const RenameError = error{
     /// On Windows, this error may be returned instead of PathAlreadyExists when
     /// renaming a directory over an existing directory.
     AccessDenied,
-    PermissionDenied,
     FileBusy,
     DiskQuota,
     IsDir,
@@ -2650,7 +2629,7 @@ pub fn renameZ(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameError!voi
     switch (errno(system.rename(old_path, new_path))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .BUSY => return error.FileBusy,
         .DQUOT => return error.DiskQuota,
         .FAULT => unreachable,
@@ -2713,7 +2692,7 @@ fn renameatWasi(old: RelativePathWasi, new: RelativePathWasi) RenameError!void {
     switch (wasi.path_rename(old.dir_fd, old.relative_path.ptr, old.relative_path.len, new.dir_fd, new.relative_path.ptr, new.relative_path.len)) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .BUSY => return error.FileBusy,
         .DQUOT => return error.DiskQuota,
         .FAULT => unreachable,
@@ -2765,7 +2744,7 @@ pub fn renameatZ(
     switch (errno(system.renameat(old_dir_fd, old_path, new_dir_fd, new_path))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .BUSY => return error.FileBusy,
         .DQUOT => return error.DiskQuota,
         .FAULT => unreachable,
@@ -2872,12 +2851,12 @@ pub fn renameatW(
 
         rc =
             windows.ntdll.NtSetInformationFile(
-                src_fd,
-                &io_status_block,
-                rename_info,
-                @intCast(struct_len), // already checked for error.NameTooLong
-                .FileRenameInformation,
-            );
+            src_fd,
+            &io_status_block,
+            rename_info,
+            @intCast(struct_len), // already checked for error.NameTooLong
+            .FileRenameInformation,
+        );
     }
 
     switch (rc) {
@@ -2918,7 +2897,7 @@ pub fn mkdiratWasi(dir_fd: fd_t, sub_dir_path: []const u8, mode: mode_t) MakeDir
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
         .BADF => unreachable,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
         .FAULT => unreachable,
@@ -2948,7 +2927,7 @@ pub fn mkdiratZ(dir_fd: fd_t, sub_dir_path: [*:0]const u8, mode: mode_t) MakeDir
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
         .BADF => unreachable,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
         .FAULT => unreachable,
@@ -2993,7 +2972,6 @@ pub const MakeDirError = error{
     /// In WASI, this error may occur when the file descriptor does
     /// not hold the required rights to create a new directory relative to it.
     AccessDenied,
-    PermissionDenied,
     DiskQuota,
     PathAlreadyExists,
     SymLinkLoop,
@@ -3046,7 +3024,7 @@ pub fn mkdirZ(dir_path: [*:0]const u8, mode: mode_t) MakeDirError!void {
     switch (errno(system.mkdir(dir_path, mode))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .DQUOT => return error.DiskQuota,
         .EXIST => return error.PathAlreadyExists,
         .FAULT => unreachable,
@@ -3087,7 +3065,6 @@ pub fn mkdirW(dir_path_w: []const u16, mode: mode_t) MakeDirError!void {
 
 pub const DeleteDirError = error{
     AccessDenied,
-    PermissionDenied,
     FileBusy,
     SymLinkLoop,
     NameTooLong,
@@ -3140,7 +3117,7 @@ pub fn rmdirZ(dir_path: [*:0]const u8) DeleteDirError!void {
     switch (errno(system.rmdir(dir_path))) {
         .SUCCESS => return,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .BUSY => return error.FileBusy,
         .FAULT => unreachable,
         .INVAL => return error.BadPathName,
@@ -3271,7 +3248,6 @@ pub const ReadLinkError = error{
     /// In WASI, this error may occur when the file descriptor does
     /// not hold the required rights to read value of a symbolic link relative to it.
     AccessDenied,
-    PermissionDenied,
     FileSystem,
     SymLinkLoop,
     NameTooLong,
@@ -3508,14 +3484,6 @@ pub fn setpgid(pid: pid_t, pgid: pid_t) SetPgidError!void {
     }
 }
 
-pub fn getuid() uid_t {
-    return system.getuid();
-}
-
-pub fn geteuid() uid_t {
-    return system.geteuid();
-}
-
 /// Test whether a file descriptor refers to a terminal.
 pub fn isatty(handle: fd_t) bool {
     if (native_os == .windows) {
@@ -3560,7 +3528,7 @@ pub fn isatty(handle: fd_t) bool {
 pub const SocketError = error{
     /// Permission to create a socket of the specified type and/or
     /// pro‐tocol is denied.
-    AccessDenied,
+    PermissionDenied,
 
     /// The implementation does not support the specified address family.
     AddressFamilyNotSupported,
@@ -3630,7 +3598,7 @@ pub fn socket(domain: u32, socket_type: u32, protocol: u32) SocketError!socket_t
             }
             return fd;
         },
-        .ACCES => return error.AccessDenied,
+        .ACCES => return error.PermissionDenied,
         .AFNOSUPPORT => return error.AddressFamilyNotSupported,
         .INVAL => return error.ProtocolFamilyNotAvailable,
         .MFILE => return error.ProcessFdQuotaExceeded,
@@ -4214,9 +4182,6 @@ pub const ConnectError = error{
     /// or
     /// The user tried to connect to a broadcast address without having the socket broadcast flag enabled  or
     /// the connection request failed because of a local firewall rule.
-    AccessDenied,
-
-    /// See AccessDenied
     PermissionDenied,
 
     /// Local address is already in use.
@@ -4290,7 +4255,7 @@ pub fn connect(sock: socket_t, sock_addr: *const sockaddr, len: socklen_t) Conne
     while (true) {
         switch (errno(system.connect(sock, sock_addr, len))) {
             .SUCCESS => return,
-            .ACCES => return error.AccessDenied,
+            .ACCES => return error.PermissionDenied,
             .PERM => return error.PermissionDenied,
             .ADDRINUSE => return error.AddressInUse,
             .ADDRNOTAVAIL => return error.AddressNotAvailable,
@@ -4352,7 +4317,7 @@ pub fn getsockoptError(sockfd: fd_t) ConnectError!void {
     switch (errno(rc)) {
         .SUCCESS => switch (@as(E, @enumFromInt(err_code))) {
             .SUCCESS => return,
-            .ACCES => return error.AccessDenied,
+            .ACCES => return error.PermissionDenied,
             .PERM => return error.PermissionDenied,
             .ADDRINUSE => return error.AddressInUse,
             .ADDRNOTAVAIL => return error.AddressNotAvailable,
@@ -4427,7 +4392,6 @@ pub const FStatError = error{
     /// In WASI, this error may occur when the file descriptor does
     /// not hold the required rights to get its filestat information.
     AccessDenied,
-    PermissionDenied,
 } || UnexpectedError;
 
 /// Return information about a file descriptor.
@@ -4496,7 +4460,7 @@ pub fn fstatatZ(dirfd: fd_t, pathname: [*:0]const u8, flags: u32) FStatAtError!S
         .BADF => unreachable, // Always a race condition.
         .NOMEM => return error.SystemResources,
         .ACCES => return error.AccessDenied,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         .FAULT => unreachable,
         .NAMETOOLONG => return error.NameTooLong,
         .LOOP => return error.SymLinkLoop,
@@ -4789,9 +4753,6 @@ pub const MMapError = error{
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
     OutOfMemory,
-
-    /// Using FIXED_NOREPLACE flag and the process has already mapped memory at the given address
-    MappingAlreadyExists,
 } || UnexpectedError;
 
 /// Map files or devices into memory.
@@ -4830,7 +4791,6 @@ pub fn mmap(
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOMEM => return error.OutOfMemory,
-        .EXIST => return error.MappingAlreadyExists,
         else => return unexpectedErrno(err),
     }
 }
@@ -4900,7 +4860,6 @@ pub fn msync(memory: []align(page_size_min) u8, flags: i32) MSyncError!void {
 }
 
 pub const AccessError = error{
-    AccessDenied,
     PermissionDenied,
     FileNotFound,
     NameTooLong,
@@ -4927,7 +4886,10 @@ pub const AccessError = error{
 /// Windows. See `fs` for the cross-platform file system API.
 pub fn access(path: []const u8, mode: u32) AccessError!void {
     if (native_os == .windows) {
-        const path_w = try windows.sliceToPrefixedFileW(null, path);
+        const path_w = windows.sliceToPrefixedFileW(null, path) catch |err| switch (err) {
+            error.AccessDenied => return error.PermissionDenied,
+            else => |e| return e,
+        };
         _ = try windows.GetFileAttributesW(path_w.span().ptr);
         return;
     } else if (native_os == .wasi and !builtin.link_libc) {
@@ -4940,7 +4902,10 @@ pub fn access(path: []const u8, mode: u32) AccessError!void {
 /// Same as `access` except `path` is null-terminated.
 pub fn accessZ(path: [*:0]const u8, mode: u32) AccessError!void {
     if (native_os == .windows) {
-        const path_w = try windows.cStrToPrefixedFileW(null, path);
+        const path_w = windows.cStrToPrefixedFileW(null, path) catch |err| switch (err) {
+            error.AccessDenied => return error.PermissionDenied,
+            else => |e| return e,
+        };
         _ = try windows.GetFileAttributesW(path_w.span().ptr);
         return;
     } else if (native_os == .wasi and !builtin.link_libc) {
@@ -4948,7 +4913,7 @@ pub fn accessZ(path: [*:0]const u8, mode: u32) AccessError!void {
     }
     switch (errno(system.access(path, mode))) {
         .SUCCESS => return,
-        .ACCES => return error.AccessDenied,
+        .ACCES => return error.PermissionDenied,
         .PERM => return error.PermissionDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .LOOP => return error.SymLinkLoop,
@@ -4983,14 +4948,19 @@ pub fn faccessat(dirfd: fd_t, path: []const u8, mode: u32, flags: u32) AccessErr
     } else if (native_os == .wasi and !builtin.link_libc) {
         const resolved: RelativePathWasi = .{ .dir_fd = dirfd, .relative_path = path };
 
-        const st = try std.os.fstatat_wasi(dirfd, path, .{
-            .SYMLINK_FOLLOW = (flags & AT.SYMLINK_NOFOLLOW) == 0,
-        });
+        const st = blk: {
+            break :blk std.os.fstatat_wasi(dirfd, path, .{
+                .SYMLINK_FOLLOW = (flags & AT.SYMLINK_NOFOLLOW) == 0,
+            });
+        } catch |err| switch (err) {
+            error.AccessDenied => return error.PermissionDenied,
+            else => |e| return e,
+        };
 
         if (mode != F_OK) {
             var directory: wasi.fdstat_t = undefined;
             if (wasi.fd_fdstat_get(resolved.dir_fd, &directory) != .SUCCESS) {
-                return error.AccessDenied;
+                return error.PermissionDenied;
             }
 
             var rights: wasi.rights_t = .{};
@@ -5010,7 +4980,7 @@ pub fn faccessat(dirfd: fd_t, path: []const u8, mode: u32, flags: u32) AccessErr
             const rights_int: u64 = @bitCast(rights);
             const inheriting_int: u64 = @bitCast(directory.fs_rights_inheriting);
             if ((rights_int & inheriting_int) != rights_int) {
-                return error.AccessDenied;
+                return error.PermissionDenied;
             }
         }
         return;
@@ -5029,7 +4999,7 @@ pub fn faccessatZ(dirfd: fd_t, path: [*:0]const u8, mode: u32, flags: u32) Acces
     }
     switch (errno(system.faccessat(dirfd, path, mode, flags))) {
         .SUCCESS => return,
-        .ACCES => return error.AccessDenied,
+        .ACCES => return error.PermissionDenied,
         .PERM => return error.PermissionDenied,
         .ROFS => return error.ReadOnlyFileSystem,
         .LOOP => return error.SymLinkLoop,
@@ -5080,7 +5050,7 @@ pub fn faccessatW(dirfd: fd_t, sub_path_w: [*:0]const u16) AccessError!void {
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
         .OBJECT_NAME_INVALID => unreachable,
         .INVALID_PARAMETER => unreachable,
-        .ACCESS_DENIED => return error.AccessDenied,
+        .ACCESS_DENIED => return error.PermissionDenied,
         .OBJECT_PATH_SYNTAX_BAD => unreachable,
         else => |rc| return windows.unexpectedStatus(rc),
     }
@@ -5175,10 +5145,10 @@ pub fn sysctl(
     newlen: usize,
 ) SysCtlError!void {
     if (native_os == .wasi) {
-        @compileError("sysctl not supported on WASI");
+        @panic("unsupported"); // TODO should be compile error, not panic
     }
     if (native_os == .haiku) {
-        @compileError("sysctl not supported on Haiku");
+        @panic("unsupported"); // TODO should be compile error, not panic
     }
 
     const name_len = cast(c_uint, name.len) orelse return error.NameTooLong;
@@ -5200,10 +5170,10 @@ pub fn sysctlbynameZ(
     newlen: usize,
 ) SysCtlError!void {
     if (native_os == .wasi) {
-        @compileError("sysctl not supported on WASI");
+        @panic("unsupported"); // TODO should be compile error, not panic
     }
     if (native_os == .haiku) {
-        @compileError("sysctl not supported on Haiku");
+        @panic("unsupported"); // TODO should be compile error, not panic
     }
 
     switch (errno(system.sysctlbyname(name, oldp, oldlenp, newp, newlen))) {
@@ -5462,7 +5432,6 @@ pub fn flock(fd: fd_t, operation: i32) FlockError!void {
 pub const RealPathError = error{
     FileNotFound,
     AccessDenied,
-    PermissionDenied,
     NameTooLong,
     NotSupported,
     NotDir,
@@ -5726,10 +5695,7 @@ pub const ClockGetTimeError = error{UnsupportedClock} || UnexpectedError;
 
 pub fn clock_gettime(clock_id: clockid_t) ClockGetTimeError!timespec {
     var tp: timespec = undefined;
-
-    if (native_os == .windows) {
-        @compileError("Windows does not support POSIX; use Windows-specific API or cross-platform std.time API");
-    } else if (native_os == .wasi and !builtin.link_libc) {
+    if (native_os == .wasi and !builtin.link_libc) {
         var ts: timestamp_t = undefined;
         switch (system.clock_time_get(clock_id, 1, &ts)) {
             .SUCCESS => {
@@ -5742,6 +5708,23 @@ pub fn clock_gettime(clock_id: clockid_t) ClockGetTimeError!timespec {
             else => |err| return unexpectedErrno(err),
         }
         return tp;
+    }
+    if (native_os == .windows) {
+        if (clock_id == .REALTIME) {
+            var ft: windows.FILETIME = undefined;
+            windows.kernel32.GetSystemTimeAsFileTime(&ft);
+            // FileTime has a granularity of 100 nanoseconds and uses the NTFS/Windows epoch.
+            const ft64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            const ft_per_s = std.time.ns_per_s / 100;
+            tp = .{
+                .sec = @as(i64, @intCast(ft64 / ft_per_s)) + std.time.epoch.windows,
+                .nsec = @as(c_long, @intCast(ft64 % ft_per_s)) * 100,
+            };
+            return tp;
+        } else {
+            // TODO POSIX implementation of CLOCK.MONOTONIC on Windows.
+            return error.UnsupportedClock;
+        }
     }
 
     switch (errno(system.clock_gettime(clock_id, &tp))) {
@@ -6844,7 +6827,7 @@ pub const SetSockOptError = error{
     /// Insufficient resources are available in the system to complete the call.
     SystemResources,
 
-    /// Setting the socket option requires more elevated permissions.
+    // Setting the socket option requires more elevated permissions.
     PermissionDenied,
 
     OperationNotSupported,
@@ -7339,7 +7322,7 @@ pub fn perf_event_open(
 }
 
 pub const TimerFdCreateError = error{
-    PermissionDenied,
+    AccessDenied,
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
     NoDevice,
@@ -7358,7 +7341,7 @@ pub fn timerfd_create(clock_id: system.timerfd_clockid_t, flags: system.TFD) Tim
         .NFILE => return error.SystemFdQuotaExceeded,
         .NODEV => return error.NoDevice,
         .NOMEM => return error.SystemResources,
-        .PERM => return error.PermissionDenied,
+        .PERM => return error.AccessDenied,
         else => |err| return unexpectedErrno(err),
     };
 }
@@ -7500,7 +7483,7 @@ pub fn ioctl_SIOCGIFINDEX(fd: fd_t, ifr: *ifreq) IoCtl_SIOCGIFINDEX_Error!void {
     }
 }
 
-const lfs64_abi = native_os == .linux and builtin.link_libc and (builtin.abi.isGnu() or builtin.abi.isAndroid());
+const lfs64_abi = native_os == .linux and builtin.link_libc and builtin.abi.isGnu();
 
 /// Whether or not `error.Unexpected` will print its value and a stack trace.
 ///
